@@ -14,6 +14,7 @@ from pathlib import Path
 from google import genai
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from PIL import Image
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
@@ -207,6 +208,18 @@ def load_statements() -> pd.DataFrame:
     return df
 
 
+def get_previous_banks() -> list[str]:
+    """ดึงรายชื่อธนาคาร/บัตรที่เคยนำเข้ามาแล้ว เรียงตามล่าสุดก่อน (ไม่ซ้ำกัน)"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT bank, MAX(imported_at) as last_import "
+        "FROM statements WHERE bank IS NOT NULL AND bank != '' "
+        "GROUP BY bank ORDER BY last_import DESC"
+    ).fetchall()
+    conn.close()
+    return [row["bank"].strip() for row in rows if row["bank"].strip()]
+
+
 def compute_file_hash(raw: bytes) -> str:
     """คำนวณ SHA-256 hash ของไฟล์ เพื่อตรวจสอบไฟล์ซ้ำ"""
     return hashlib.sha256(raw).hexdigest()
@@ -256,7 +269,9 @@ def extract_from_image(model, image: Image.Image) -> dict:
       "is_payment": false
     }
   ],
-  "cutoff_day": 20
+  "cutoff_day": 20,
+  "bank_name": "กสิกรไทย",
+  "card_name": "Visa Platinum"
 }
 
 กฎ:
@@ -269,7 +284,9 @@ def extract_from_image(model, image: Image.Image) -> dict:
 - amount เป็นตัวเลขล้วน ไม่มี comma
 - is_payment = true สำหรับรายการชำระเงิน (Payment, ยอดชำระ, ยอดเรียกเก็บ)
 - cutoff_day = วันที่ตัดรอบบิล (เช่น 15, 20, 25) ถ้าไม่เจอให้ใส่ null
-- ถ้าไม่มีรายการในภาพ ให้ส่ง {"transactions": [], "cutoff_day": null}
+- bank_name = ชื่อธนาคารผู้ออกบัตร เช่น "กสิกรไทย", "ไทยพาณิชย์", "กรุงไทย", "กรุงศรี", "ทหารไทยธนชาต", "ซิตี้แบงก์" ถ้าไม่เจอให้ใส่ null
+- card_name = ชื่อประเภทบัตร เช่น "Visa Platinum", "World Mastercard", "JCB Precious" ถ้าไม่เจอให้ใส่ null
+- ถ้าไม่มีรายการในภาพ ให้ส่ง {"transactions": [], "cutoff_day": null, "bank_name": null, "card_name": null}
 
 สำคัญมาก — หน้าที่ต้องข้ามทั้งหมด (ส่ง {"transactions": [], "cutoff_day": null} กลับ):
 - หน้า "วิธีการชำระเงิน" / "Methods of Payment"
@@ -457,6 +474,7 @@ def pdf_to_images(raw: bytes, password: str = "") -> list:
 
 
 def process_uploaded_file(raw: bytes, filename: str, model, password: str = "") -> tuple:
+    from collections import Counter
     name = filename.lower()
 
     if name.endswith(".pdf"):
@@ -467,19 +485,24 @@ def process_uploaded_file(raw: bytes, filename: str, model, password: str = "") 
 
     all_txns = []
     cutoff_days = []  # เก็บ cutoff_day จากทุกหน้า
+    bank_names = []   # เก็บชื่อธนาคารจากทุกหน้า
+    card_names = []   # เก็บชื่อบัตรจากทุกหน้า
     for img in images:
         try:
             result = extract_from_image(model, img)
             all_txns.extend(result.get("transactions", []))
             if result.get("cutoff_day"):
                 cutoff_days.append(result["cutoff_day"])
+            if result.get("bank_name"):
+                bank_names.append(result["bank_name"])
+            if result.get("card_name"):
+                card_names.append(result["card_name"])
         except Exception as e:
             st.warning(f"อ่านบางหน้าไม่ได้: {e}")
 
     # เลือก cutoff_day ที่เจอบ่อยที่สุด (ถ้ามี)
     cutoff_day = None
     if cutoff_days:
-        from collections import Counter
         cutoff_day = Counter(cutoff_days).most_common(1)[0][0]
 
     # Remove payment rows
@@ -530,7 +553,19 @@ def process_uploaded_file(raw: bytes, filename: str, model, password: str = "") 
             for t in expenses:
                 t["subcategory"] = None
 
-    return expenses, cutoff_day
+    # สร้าง suggested_bank จากชื่อธนาคาร/บัตรที่อ่านได้จาก statement
+    suggested_bank = None
+    if bank_names or card_names:
+        bank_count = Counter(b for b in bank_names if b)
+        card_count = Counter(c for c in card_names if c)
+        top_bank = bank_count.most_common(1)[0][0] if bank_count else ""
+        top_card = card_count.most_common(1)[0][0] if card_count else ""
+        if top_bank and top_card:
+            suggested_bank = f"{top_bank} {top_card}"
+        else:
+            suggested_bank = top_bank or top_card or None
+
+    return expenses, cutoff_day, suggested_bank
 
 # ─── Pages ────────────────────────────────────────────────────────────────────
 
@@ -543,10 +578,27 @@ def page_import():
         st.success(msg)
         st.balloons()
 
+    # ── Auto-fill ชื่อธนาคารที่ระบบตรวจพบจาก statement (ถ้ายังไม่ได้กรอก) ──────
+    if st.session_state.get("_detected_bank"):
+        if not st.session_state.get("_bank_input", "").strip():
+            st.session_state["_bank_input"] = st.session_state["_detected_bank"]
+        del st.session_state["_detected_bank"]
+
+    # ── Previous bank quick-select ─────────────────────────────────────────────
+    prev_banks = get_previous_banks()
+    if prev_banks:
+        st.caption("💡 เลือกจากที่เคยนำเข้า:")
+        btn_cols = st.columns(min(len(prev_banks), 5))
+        for i, b in enumerate(prev_banks[:5]):
+            if btn_cols[i].button(b, key=f"_prev_bank_{i}", use_container_width=True):
+                st.session_state["_bank_input"] = b
+                st.rerun()
+
     bank = st.text_input(
         "ชื่อธนาคาร / บัตร",
         placeholder="เช่น KTB Visa, SCB Platinum, KBANK",
-        help="ใส่ชื่อเพื่อแยกแยะในภายหลัง",
+        help="ใส่ชื่อเพื่อแยกแยะในภายหลัง — ระบบจะพยายามตรวจจับอัตโนมัติหลังอ่าน statement",
+        key="_bank_input",
     )
 
     # key เปลี่ยนทุกครั้งที่ save → บังคับ file_uploader reset เป็นว่างเปล่า
@@ -580,7 +632,7 @@ def page_import():
                     help="ใช้เฉพาะเปิด PDF — ไม่ถูกบันทึก",
                 )
 
-    if uploaded and bank:
+    if uploaded:
         if st.button("วิเคราะห์", type="primary", use_container_width=True):
             model = get_model()
             all_txns = []
@@ -588,6 +640,7 @@ def page_import():
             file_hashes = []
             errors = []
             cutoff_days = []
+            suggested_banks = []
             progress = st.progress(0, text="กำลังอ่านไฟล์...")
 
             for i, f in enumerate(uploaded):
@@ -607,7 +660,7 @@ def page_import():
                             )
                         else:
                             password = pdf_password if f.name.lower().endswith(".pdf") else ""
-                            txns, cutoff_day = process_uploaded_file(raw, f.name, model, password)
+                            txns, cutoff_day, suggested_bank = process_uploaded_file(raw, f.name, model, password)
                             for t in txns:
                                 t["bank"] = bank
                             all_txns.extend(txns)
@@ -615,6 +668,8 @@ def page_import():
                             file_hashes.append(file_hash)
                             if cutoff_day:
                                 cutoff_days.append(cutoff_day)
+                            if suggested_bank:
+                                suggested_banks.append(suggested_bank)
                     except ValueError as e:
                         if "PDF_NEEDS_PASSWORD" in str(e):
                             errors.append(f"**{f.name}** — PDF นี้มีรหัสผ่าน กรุณาเปิด 'PDF มีรหัสผ่าน' แล้วใส่รหัส")
@@ -628,6 +683,12 @@ def page_import():
 
             for err in errors:
                 st.error(err)
+
+            # ถ้าระบุชื่อธนาคารยังไม่ได้ → auto-suggest จากที่อ่านได้
+            if suggested_banks and not st.session_state.get("_bank_input", "").strip():
+                from collections import Counter as _Counter
+                best_bank = _Counter(suggested_banks).most_common(1)[0][0]
+                st.session_state["_detected_bank"] = best_bank
 
             if all_txns:
                 # เลือก cutoff_day ที่เจอบ่อยที่สุด (ถ้ามี)
@@ -677,6 +738,12 @@ def page_import():
             if st.button("บันทึก", type="primary", use_container_width=True):
                 all_rows = edited.to_dict("records")
 
+                # ตรวจสอบชื่อธนาคาร (อาจถูก auto-fill หลัง analyze หรือผู้ใช้กรอกเอง)
+                current_bank = st.session_state.get("_bank_input", "").strip()
+                if not current_bank:
+                    st.warning("กรุณาระบุชื่อธนาคาร / บัตร ก่อนบันทึก")
+                    st.stop()
+
                 # กรองบรรทัดว่างออก (เกิดจาก data_editor เพิ่มแถวว่าง หรือผู้ใช้ลบเนื้อหาในแถว)
                 final = [
                     row for row in all_rows
@@ -695,20 +762,19 @@ def page_import():
                         row["posting_date"] = orig.get("posting_date", "")
 
                     save_transactions(
-                        st.session_state["pending_bank"],
+                        current_bank,
                         st.session_state["pending_files"],
                         final,
                         st.session_state.get("pending_cutoff_day"),
                         st.session_state.get("pending_file_hashes"),
                     )
-                    bank_name = st.session_state.get("pending_bank", "")
                     n = len(final)
                     for key in ["pending", "pending_bank", "pending_files",
                                 "pending_cutoff_day", "pending_file_hashes"]:
                         st.session_state.pop(key, None)
                     # เก็บข้อความสำเร็จ + เพิ่ม revision เพื่อ reset file uploader
                     st.session_state["_import_success"] = (
-                        f"✅ นำเข้าสำเร็จ! บันทึก {n} รายการ ({bank_name}) เรียบร้อยแล้ว"
+                        f"✅ นำเข้าสำเร็จ! บันทึก {n} รายการ ({current_bank}) เรียบร้อยแล้ว"
                     )
                     st.session_state["_upload_rev"] = st.session_state.get("_upload_rev", 0) + 1
                     st.rerun()
@@ -734,7 +800,7 @@ def page_dashboard():
         "ช่วงเวลา",
         options=list(period_options.keys()),
         format_func=lambda x: period_options[x],
-        index=0,  # default = เดือนนี้
+        index=1,  # default = เดือนที่แล้ว
     )
 
     period_label = period_options[period]
@@ -835,38 +901,71 @@ def page_dashboard():
         st.subheader("สัดส่วนตามหมวดหมู่")
 
         # สร้าง path สำหรับ sunburst: category > subcategory
-        df_chart = df.copy()
+        # กรองเฉพาะรายการที่ยอดเงิน > 0 เพื่อไม่ให้กราฟ Sunburst มีปัญหาติดลบ
+        df_chart = df[df["amount"] > 0].copy()
         df_chart["display_path"] = df_chart.apply(
             lambda row: f"{row['category']} > {row['subcategory']}"
-                if pd.notna(row['subcategory']) else row['category'],
+                if pd.notna(row['subcategory']) and str(row['subcategory']).strip() != ""
+                else row['category'],
             axis=1
         )
 
-        # Group by path
+        # Group by path และรวม amount
         path_df = df_chart.groupby("display_path")["amount"].sum().reset_index()
-        path_df = path_df.sort_values("amount", ascending=False)
 
-        # สร้าง sunburst data
-        sunburst_data = []
+        # สร้าง go.Sunburst nodes แบบ explicit
+        # รองรับกรณี category มีทั้งรายการที่มี subcategory และไม่มี (px.sunburst ทำไม่ได้)
+        cat_totals: dict = {}   # cat → ยอดรวมทั้งหมด
+        cat_subs: dict = {}     # cat → {sub → amount}
+
         for _, row in path_df.iterrows():
-            parts = row["display_path"].split(" > ")
+            parts = row["display_path"].split(" > ", 1)
+            cat = parts[0]
+            amt = row["amount"]
+            cat_totals[cat] = cat_totals.get(cat, 0) + amt
             if len(parts) == 2:
-                sunburst_data.append({"category": parts[0], "subcategory": parts[1], "amount": row["amount"]})
-            else:
-                sunburst_data.append({"category": parts[0], "subcategory": "", "amount": row["amount"]})
+                if cat not in cat_subs:
+                    cat_subs[cat] = {}
+                cat_subs[cat][parts[1]] = cat_subs[cat].get(parts[1], 0) + amt
 
-        sunburst_df = pd.DataFrame(sunburst_data)
+        ids, labels, parents, values = [], [], [], []
 
-        fig = px.sunburst(
-            sunburst_df,
-            path=["category", "subcategory"],
-            values="amount",
-            color_discrete_sequence=px.colors.qualitative.Set3,
-        )
-        fig.update_traces(
-            textinfo="label+percent parent+value",
-            hovertemplate="<b>%{label}</b><br>฿%{value:,.0f}<br>%{percentParent}<extra></extra>"
-        )
+        # Category nodes (ชั้นแรก — รากของแต่ละหมวด)
+        for cat, total in cat_totals.items():
+            ids.append(cat)
+            labels.append(cat)
+            parents.append("")
+            values.append(total)
+
+        # Subcategory nodes (ชั้นที่สอง)
+        for cat, subs in cat_subs.items():
+            sub_total = sum(subs.values())
+            remainder = cat_totals[cat] - sub_total
+
+            for sub, amt in subs.items():
+                ids.append(f"{cat}/{sub}")
+                labels.append(sub)
+                parents.append(cat)
+                values.append(amt)
+
+            # รายการที่ไม่มี subcategory → รวมเป็น "อื่นๆ" เพื่อไม่ให้มีช่องว่างขาว
+            if remainder > 0.01:
+                ids.append(f"{cat}/_other")
+                labels.append("อื่นๆ")
+                parents.append(cat)
+                values.append(remainder)
+
+        fig = go.Figure(go.Sunburst(
+            ids=ids,
+            labels=labels,
+            parents=parents,
+            values=values,
+            branchvalues="total",
+            textinfo="label+value+percent parent",
+            texttemplate="%{label}<br>฿%{value:,.0f}<br>%{percentParent:.1%}",
+            insidetextorientation="radial",
+            hovertemplate="<b>%{label}</b><br>฿%{value:,.0f}<br>%{percentParent:.1%}<extra></extra>",
+        ))
         fig.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10))
         st.plotly_chart(fig, use_container_width=True)
 
