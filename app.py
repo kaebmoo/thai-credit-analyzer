@@ -47,6 +47,7 @@ CATEGORIES = [
     "เดินทาง",
     "บริการรถยนต์",
     "สุขภาพ",
+    "ช้อปปิ้ง",
     "อื่นๆ",
 ]
 
@@ -56,12 +57,13 @@ SUBCATEGORIES = {
     "ทางด่วน/ขนส่ง": ["ทางด่วน", "แท็กซี่/Grab", "รถไฟฟ้า", "น้ำมัน"],
     "เดินทาง": ["โรงแรม", "ตั๋วเครื่องบิน", "ทัวร์", "ที่เที่ยว", "รถเช่า"],
     "Subscription/ดิจิทัล": ["Netflix/Streaming", "Spotify/Music", "เกม", "Cloud/Software"],
-    "ร้านสะดวกซื้อ": ["7-11", "Family Mart", "Lotus Go", "อื่นๆ"],
+    "ร้านสะดวกซื้อ": ["CJ", "7-11", "Family Mart", "Lotus Go", "อื่นๆ"],
     "ซุปเปอร์มาร์เก็ต": ["Lotus", "Big C", "Tops", "Villa Market", "Makro"],
     "โทรศัพท์/อินเทอร์เน็ต": ["AIS", "True", "DTAC", "3BB/Fiber"],
     "ประกัน": ["รถยนต์", "สุขภาพ", "ชีวิต", "ทรัพย์สิน"],
-    "บริการรถยนต์": ["ยาง/เบรก", "น้ำมันเครื่อง", "แบตเตอรี่", "ซ่อมบำรุง", "ล้างรถ"],
+    "บริการรถยนต์": ["ยาง/เบรก", "น้ำมันเชื้อเพลิง", "แบตเตอรี่", "ซ่อมบำรุง", "ล้างรถ"],
     "สุขภาพ": ["โรงพยาบาล", "คลินิก", "ร้านขายยา", "ทันตกรรม", "ตรวจสุขภาพ"],
+    "ช้อปปิ้ง": ["กีฬา", "เสื้อผ้า", "ของใช้บ้าน", "ห้างสรรพสินค้า", "อิเล็กทรอนิกส์"],
 }
 
 # ─── Database ─────────────────────────────────────────────────────────────────
@@ -81,7 +83,8 @@ def init_db():
             bank        TEXT,
             period      TEXT,
             imported_at TEXT,
-            tx_count    INTEGER
+            tx_count    INTEGER,
+            cutoff_day  INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS transactions (
@@ -92,10 +95,20 @@ def init_db():
             description   TEXT,
             amount        REAL,
             category      TEXT,
+            subcategory   TEXT,
             bank          TEXT,
             FOREIGN KEY (statement_id) REFERENCES statements(id)
         );
     """)
+
+    # Migration: add missing columns for existing databases (won't run on fresh install)
+    stmt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(statements)").fetchall()}
+    tx_cols   = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "cutoff_day" not in stmt_cols:
+        conn.execute("ALTER TABLE statements ADD COLUMN cutoff_day INTEGER")
+    if "subcategory" not in tx_cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN subcategory TEXT")
+
     conn.commit()
     conn.close()
 
@@ -135,10 +148,15 @@ def save_transactions(bank: str, filenames: list, transactions: list, cutoff_day
 
 def delete_statement(stmt_id: int):
     conn = get_db()
-    conn.execute("DELETE FROM transactions WHERE statement_id=?", (stmt_id,))
-    conn.execute("DELETE FROM statements WHERE id=?", (stmt_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("DELETE FROM transactions WHERE statement_id=?", (stmt_id,))
+        conn.execute("DELETE FROM statements WHERE id=?", (stmt_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def load_transactions(period: str = "all") -> pd.DataFrame:
@@ -213,11 +231,24 @@ def extract_from_image(model, image: Image.Image) -> dict:
 }
 
 กฎ:
-- วันที่ให้แปลงเป็น YYYY-MM-DD เสมอ ถ้าเห็นแค่ 2 หลักสุดท้ายของปี (เช่น 26) ให้ใช้ 2026
+- วันที่ให้แปลงเป็น YYYY-MM-DD เสมอ
+- ใบแจ้งยอดไทยใช้รูปแบบ dd/mm/yy หรือ dd/mm/yyyy (วันก่อน เดือนหลัง เสมอ)
+  เช่น "17/01/26" = วันที่ 17 เดือน 01 (มกราคม) ปี 2026 → 2026-01-17
+       "05/02/26" = วันที่ 5 เดือน 02 (กุมภาพันธ์) ปี 2026 → 2026-02-05
+- ถ้าเห็นแค่ 2 หลักสุดท้ายของปี (เช่น 26) ให้ใช้ 2026
+- ห้ามสลับวันกับเดือน — ตัวเลขแรก (ก่อน /) คือวัน ตัวเลขที่สอง คือเดือน
 - amount เป็นตัวเลขล้วน ไม่มี comma
 - is_payment = true สำหรับรายการชำระเงิน (Payment, ยอดชำระ, ยอดเรียกเก็บ)
 - cutoff_day = วันที่ตัดรอบบิล (เช่น 15, 20, 25) ถ้าไม่เจอให้ใส่ null
 - ถ้าไม่มีรายการในภาพ ให้ส่ง {"transactions": [], "cutoff_day": null}
+
+สำคัญมาก — หน้าที่ต้องข้ามทั้งหมด (ส่ง {"transactions": [], "cutoff_day": null} กลับ):
+- หน้า "วิธีการชำระเงิน" / "Methods of Payment"
+- หน้า "ตัวอย่างการคำนวณดอกเบี้ย" / "Example of Interest Calculation"
+- หน้าที่มีหัวข้อหรือข้อความ "ตัวอย่าง" / "Example" เด่นชัด ซึ่งรายการในนั้นเป็นเพียงการอธิบาย ไม่ใช่รายการจริง
+- หน้าแบบฟอร์มการชำระเงิน (Pay-in Slip) ที่ไม่มีรายการค่าใช้จ่าย
+- หน้าที่รายการส่วนใหญ่มีปี ค.ศ. ต่างจากปีหลัก (statement) เกิน 2 ปี → ข้ามทั้งหน้า
+  (เช่น statement ปี 2026 แต่รายการในหน้านั้นมีปี 2020, 2021 = ตัวอย่างดอกเบี้ย → ไม่ใช่รายการจริง)
 """
     response = model.models.generate_content(
         model="gemini-2.0-flash",
@@ -276,7 +307,7 @@ def categorize(model, descriptions: list, examples: list[dict] | None = None) ->
 ตัวอย่าง output: ["ร้านสะดวกซื้อ", "Subscription/ดิจิทัล"]
 
 แนวทางการจัด (ใช้เมื่อไม่มีตัวอย่างตรงๆ):
-- 7-11, 7-ELEVEN, TMN 7-11 → ร้านสะดวกซื้อ
+- CJ, 7-11, 7-ELEVEN, TMN 7-11 → ร้านสะดวกซื้อ
 - Netflix, Spotify, Google, Apple, Anthropic, Claude, Microsoft, LINE, Adobe, ChatGPT, DYN, Moonshot → Subscription/ดิจิทัล
 - Shopee, Lazada, Temu, 2C2P, LAZADA → ช้อปปิ้งออนไลน์
 - EASYBILLS, Easy Pass, Expressway, BEM, GRABTAXI, GRAB TAXI → ทางด่วน/ขนส่ง
@@ -287,6 +318,7 @@ def categorize(model, descriptions: list, examples: list[dict] | None = None) ->
 - Airline, Hotel, Travel, Agoda, Booking, TRAVEL, ASCENDTRAVEL → เดินทาง
 - AIA, Insurance, IPAYAGT, QR-AIA, ประกัน → ประกัน
 - B-QUIK, Firestone, Bridgestone, Goodyear, Autocare, ช่างยนต์, ซ่อมรถ, เปลี่ยนยาง, เปลี่ยนถ่ายน้ำมัน → บริการรถยนต์
+- DECATHLON, CENTRAL, ROBINSON, THE MALL, IKEA, INDEX, POWER BUY, BANANA IT, ห้างสรรพสินค้า, ร้านค้า offline ทั่วไป → ช้อปปิ้ง
 """
     response = model.models.generate_content(
         model="gemini-2.0-flash",
@@ -424,6 +456,25 @@ def process_uploaded_file(uploaded_file, model, password: str = "") -> tuple:
 
     # Remove payment rows
     expenses = [t for t in all_txns if not t.get("is_payment", False)]
+
+    # กรองรายการที่มีวันที่เก่าเกินจริง (รายการจาก "หน้าตัวอย่าง" ที่หลุดมา)
+    # อนุญาตย้อนหลังได้สูงสุด 3 ปีจากปีปัจจุบัน
+    current_year = datetime.now().year
+
+    def _is_recent_year(date_str: str) -> bool:
+        if not date_str:
+            return True
+        try:
+            y = int(date_str[:4])
+            return (current_year - y) <= 3
+        except Exception:
+            return True  # ถ้า parse ไม่ได้ ให้เก็บไว้ก่อน
+
+    before_filter = len(expenses)
+    expenses = [t for t in expenses if _is_recent_year(t.get("trans_date", ""))]
+    filtered_out = before_filter - len(expenses)
+    if filtered_out > 0:
+        st.info(f"ℹ️ กรอง {filtered_out} รายการที่มีวันที่เก่าเกิน 3 ปีออก (อาจเป็นรายการตัวอย่างในเอกสาร)")
 
     # โหลด few-shot examples จาก DB (ถ้ายังไม่มีข้อมูลเก่าก็ได้ [] กลับมา — ทำงานได้ปกติ)
     examples = get_few_shot_examples(limit_per_cat=3)
@@ -573,23 +624,35 @@ def page_import():
         c1, c2 = st.columns(2)
         with c1:
             if st.button("บันทึก", type="primary", use_container_width=True):
-                final = edited.to_dict("records")
-                # Merge back posting_date from original
-                orig_map = {t["description"]: t for t in txns}
-                for row in final:
-                    orig = orig_map.get(row["description"], {})
-                    row["posting_date"] = orig.get("posting_date", "")
+                all_rows = edited.to_dict("records")
 
-                save_transactions(
-                    st.session_state["pending_bank"],
-                    st.session_state["pending_files"],
-                    final,
-                    st.session_state.get("pending_cutoff_day"),
-                )
-                for key in ["pending", "pending_bank", "pending_files", "pending_cutoff_day"]:
-                    st.session_state.pop(key, None)
-                st.success("บันทึกเรียบร้อย!")
-                st.rerun()
+                # กรองบรรทัดว่างออก (เกิดจาก data_editor เพิ่มแถวว่าง หรือผู้ใช้ลบเนื้อหาในแถว)
+                final = [
+                    row for row in all_rows
+                    if str(row.get("description") or "").strip()
+                    and row.get("amount") is not None
+                    and not (isinstance(row.get("amount"), float) and pd.isna(row["amount"]))
+                ]
+
+                if not final:
+                    st.warning("ไม่มีรายการที่จะบันทึก กรุณาตรวจสอบรายการในตาราง")
+                else:
+                    # Merge back posting_date from original
+                    orig_map = {t["description"]: t for t in txns}
+                    for row in final:
+                        orig = orig_map.get(row["description"], {})
+                        row["posting_date"] = orig.get("posting_date", "")
+
+                    save_transactions(
+                        st.session_state["pending_bank"],
+                        st.session_state["pending_files"],
+                        final,
+                        st.session_state.get("pending_cutoff_day"),
+                    )
+                    for key in ["pending", "pending_bank", "pending_files", "pending_cutoff_day"]:
+                        st.session_state.pop(key, None)
+                    st.success(f"บันทึกเรียบร้อย! {len(final)} รายการ")
+                    st.rerun()
 
         with c2:
             if st.button("ยกเลิก", use_container_width=True):
