@@ -17,6 +17,7 @@ import plotly.express as px
 from PIL import Image
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
+import hashlib
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -59,7 +60,7 @@ SUBCATEGORIES = {
     "Subscription/ดิจิทัล": ["Netflix/Streaming", "Spotify/Music", "เกม", "Cloud/Software"],
     "ร้านสะดวกซื้อ": ["CJ", "7-11", "Family Mart", "Lotus Go", "อื่นๆ"],
     "ซุปเปอร์มาร์เก็ต": ["Lotus", "Big C", "Tops", "Villa Market", "Makro"],
-    "โทรศัพท์/อินเทอร์เน็ต": ["AIS", "True", "DTAC", "3BB/Fiber"],
+    "โทรศัพท์/อินเทอร์เน็ต": ["AIS", "True", "DTAC", "NT", "3BB/Fiber"],
     "ประกัน": ["รถยนต์", "สุขภาพ", "ชีวิต", "ทรัพย์สิน"],
     "บริการรถยนต์": ["ยาง/เบรก", "น้ำมันเชื้อเพลิง", "แบตเตอรี่", "ซ่อมบำรุง", "ล้างรถ"],
     "สุขภาพ": ["โรงพยาบาล", "คลินิก", "ร้านขายยา", "ทันตกรรม", "ตรวจสุขภาพ"],
@@ -84,7 +85,8 @@ def init_db():
             period      TEXT,
             imported_at TEXT,
             tx_count    INTEGER,
-            cutoff_day  INTEGER
+            cutoff_day  INTEGER,
+            file_hash   TEXT
         );
 
         CREATE TABLE IF NOT EXISTS transactions (
@@ -106,6 +108,8 @@ def init_db():
     tx_cols   = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
     if "cutoff_day" not in stmt_cols:
         conn.execute("ALTER TABLE statements ADD COLUMN cutoff_day INTEGER")
+    if "file_hash" not in stmt_cols:
+        conn.execute("ALTER TABLE statements ADD COLUMN file_hash TEXT")
     if "subcategory" not in tx_cols:
         conn.execute("ALTER TABLE transactions ADD COLUMN subcategory TEXT")
 
@@ -113,15 +117,17 @@ def init_db():
     conn.close()
 
 
-def save_transactions(bank: str, filenames: list, transactions: list, cutoff_day: int = None):
+def save_transactions(bank: str, filenames: list, transactions: list,
+                      cutoff_day: int = None, file_hashes: list = None):
     conn = get_db()
     try:
         dates = [t["trans_date"] for t in transactions if t.get("trans_date")]
         period = max(dates)[:7] if dates else datetime.now().strftime("%Y-%m")
 
+        hash_str = ",".join(file_hashes) if file_hashes else None
         cur = conn.execute(
-            "INSERT INTO statements (filename, bank, period, imported_at, tx_count, cutoff_day) VALUES (?,?,?,?,?,?)",
-            (", ".join(filenames), bank, period, datetime.now().isoformat(), len(transactions), cutoff_day),
+            "INSERT INTO statements (filename, bank, period, imported_at, tx_count, cutoff_day, file_hash) VALUES (?,?,?,?,?,?,?)",
+            (", ".join(filenames), bank, period, datetime.now().isoformat(), len(transactions), cutoff_day, hash_str),
         )
         stmt_id = cur.lastrowid
 
@@ -199,6 +205,29 @@ def load_statements() -> pd.DataFrame:
     df = pd.read_sql("SELECT * FROM statements ORDER BY imported_at DESC", conn)
     conn.close()
     return df
+
+
+def compute_file_hash(raw: bytes) -> str:
+    """คำนวณ SHA-256 hash ของไฟล์ เพื่อตรวจสอบไฟล์ซ้ำ"""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def find_duplicate_statement(file_hash: str) -> dict | None:
+    """ตรวจสอบว่าไฟล์นี้เคยนำเข้าแล้วหรือไม่ โดยเทียบ SHA-256 hash
+    คืนค่าข้อมูล statement เดิมถ้าพบ ไม่งั้นคืน None"""
+    if not file_hash:
+        return None
+    conn = get_db()
+    # file_hash อาจเก็บหลาย hash คั่นด้วย "," (กรณีนำเข้าหลายไฟล์พร้อมกัน)
+    rows = conn.execute(
+        "SELECT id, filename, bank, period, imported_at, file_hash FROM statements WHERE file_hash IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    for row in rows:
+        stored = [h.strip() for h in (row["file_hash"] or "").split(",")]
+        if file_hash in stored:
+            return dict(row)
+    return None
 
 # ─── Gemini ───────────────────────────────────────────────────────────────────
 
@@ -427,9 +456,8 @@ def pdf_to_images(raw: bytes, password: str = "") -> list:
     return images
 
 
-def process_uploaded_file(uploaded_file, model, password: str = "") -> tuple:
-    raw = uploaded_file.read()
-    name = uploaded_file.name.lower()
+def process_uploaded_file(raw: bytes, filename: str, model, password: str = "") -> tuple:
+    name = filename.lower()
 
     if name.endswith(".pdf"):
         images = pdf_to_images(raw, password)
@@ -509,16 +537,25 @@ def process_uploaded_file(uploaded_file, model, password: str = "") -> tuple:
 def page_import():
     st.header("นำเข้า Statement")
 
+    # ── แสดง banner เมื่อ save สำเร็จ (ค้างไว้ 1 render แล้วล้างทิ้ง) ──────────
+    if st.session_state.get("_import_success"):
+        msg = st.session_state.pop("_import_success")
+        st.success(msg)
+        st.balloons()
+
     bank = st.text_input(
         "ชื่อธนาคาร / บัตร",
         placeholder="เช่น KTB Visa, SCB Platinum, KBANK",
         help="ใส่ชื่อเพื่อแยกแยะในภายหลัง",
     )
 
+    # key เปลี่ยนทุกครั้งที่ save → บังคับ file_uploader reset เป็นว่างเปล่า
+    upload_key = f"uploader_{st.session_state.get('_upload_rev', 0)}"
     uploaded = st.file_uploader(
         "อัปโหลด Statement (รองรับ PDF, JPG, JPEG, PNG — หลายไฟล์พร้อมกันได้)",
         type=["pdf", "jpg", "jpeg", "png"],
         accept_multiple_files=True,
+        key=upload_key,
     )
 
     # ── PDF Password Section ─────────────────────────────────────────────────
@@ -548,6 +585,7 @@ def page_import():
             model = get_model()
             all_txns = []
             filenames = []
+            file_hashes = []
             errors = []
             cutoff_days = []
             progress = st.progress(0, text="กำลังอ่านไฟล์...")
@@ -555,14 +593,28 @@ def page_import():
             for i, f in enumerate(uploaded):
                 with st.spinner(f"กำลังอ่าน: {f.name}"):
                     try:
-                        password = pdf_password if f.name.lower().endswith(".pdf") else ""
-                        txns, cutoff_day = process_uploaded_file(f, model, password)
-                        for t in txns:
-                            t["bank"] = bank
-                        all_txns.extend(txns)
-                        filenames.append(f.name)
-                        if cutoff_day:
-                            cutoff_days.append(cutoff_day)
+                        raw = f.read()
+                        file_hash = compute_file_hash(raw)
+
+                        # ตรวจสอบไฟล์ซ้ำด้วย SHA-256 hash
+                        dup = find_duplicate_statement(file_hash)
+                        if dup:
+                            errors.append(
+                                f"**{f.name}** — ⚠️ เคยนำเข้าแล้ว "
+                                f"(ธนาคาร: {dup['bank']}, งวด: {dup['period']}, "
+                                f"นำเข้าเมื่อ: {dup['imported_at'][:10]}) — "
+                                "หากต้องการนำเข้าใหม่ กรุณาลบรายการเดิมในหน้า 'ประวัติการนำเข้า' ก่อน"
+                            )
+                        else:
+                            password = pdf_password if f.name.lower().endswith(".pdf") else ""
+                            txns, cutoff_day = process_uploaded_file(raw, f.name, model, password)
+                            for t in txns:
+                                t["bank"] = bank
+                            all_txns.extend(txns)
+                            filenames.append(f.name)
+                            file_hashes.append(file_hash)
+                            if cutoff_day:
+                                cutoff_days.append(cutoff_day)
                     except ValueError as e:
                         if "PDF_NEEDS_PASSWORD" in str(e):
                             errors.append(f"**{f.name}** — PDF นี้มีรหัสผ่าน กรุณาเปิด 'PDF มีรหัสผ่าน' แล้วใส่รหัส")
@@ -588,10 +640,9 @@ def page_import():
                 st.session_state["pending_bank"] = bank
                 st.session_state["pending_files"] = filenames
                 st.session_state["pending_cutoff_day"] = final_cutoff
+                st.session_state["pending_file_hashes"] = file_hashes
 
                 success_msg = f"พบ {len(all_txns)} รายการ"
-                if final_cutoff:
-                    success_msg += f" | วันตัดรอบ: {final_cutoff}"
                 success_msg += " — กรุณาตรวจสอบด้านล่างก่อนบันทึก"
                 st.success(success_msg)
                 st.rerun()
@@ -648,10 +699,18 @@ def page_import():
                         st.session_state["pending_files"],
                         final,
                         st.session_state.get("pending_cutoff_day"),
+                        st.session_state.get("pending_file_hashes"),
                     )
-                    for key in ["pending", "pending_bank", "pending_files", "pending_cutoff_day"]:
+                    bank_name = st.session_state.get("pending_bank", "")
+                    n = len(final)
+                    for key in ["pending", "pending_bank", "pending_files",
+                                "pending_cutoff_day", "pending_file_hashes"]:
                         st.session_state.pop(key, None)
-                    st.success(f"บันทึกเรียบร้อย! {len(final)} รายการ")
+                    # เก็บข้อความสำเร็จ + เพิ่ม revision เพื่อ reset file uploader
+                    st.session_state["_import_success"] = (
+                        f"✅ นำเข้าสำเร็จ! บันทึก {n} รายการ ({bank_name}) เรียบร้อยแล้ว"
+                    )
+                    st.session_state["_upload_rev"] = st.session_state.get("_upload_rev", 0) + 1
                     st.rerun()
 
         with c2:
@@ -680,81 +739,69 @@ def page_dashboard():
 
     period_label = period_options[period]
 
-    # toggle: group by trans_date month vs billing cycle (ย้ายขึ้นมาก่อน load)
+    # toggle: group by trans_date month vs billing period from statement
     group_mode = st.radio(
         "แสดงตาม",
-        ["เดือนที่ใช้จ่ายจริง", "รอบบิล (ตามวันตัดรอบ)"],
+        ["เดือนที่ใช้จ่ายจริง", "งวดบิล"],
         horizontal=True,
-        help="'เดือนที่ใช้จ่ายจริง' = นับตามวันที่สวایپบัตร | 'รอบบิล' = นับตามรอบที่ธนาคารเรียกเก็บ",
+        help=(
+            "'เดือนที่ใช้จ่ายจริง' = นับตามวันที่รูดบัตร  |  "
+            "'งวดบิล' = นับตามงวดใบแจ้งหนี้ของธนาคาร "
+            "(เช่น KBank ก.พ. + KTB ก.พ. = งวด ก.พ. เดียวกัน ไม่ต้องตั้งวันตัดรอบ)"
+        ),
     )
 
-    # โหลดค่า cutoff_day จาก config
-    default_cutoff = 20
-    if CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text())
-            default_cutoff = cfg.get("cutoff_day", 20)
-        except Exception:
-            pass
-
-    cutoff_day = default_cutoff
-    if group_mode == "รอบบิล (ตามวันตัดรอบ)":
-        cutoff_day = st.number_input(
-            "วันที่ตัดรอบบิล", min_value=1, max_value=28, value=default_cutoff,
-            help="เช่น ถ้าตัดวันที่ 20 ใส่ 20 | ตั้งค่าเริ่มต้นได้ในหน้า 'ตั้งค่า'"
-        )
-
-    # Load data - ถ้าเลือก "รอบบิล" + single month → load ทั้งหมดแล้ว filter ทีหลัง
-    if group_mode == "รอบบิล (ตามวันตัดรอบ)" and period in ["current_month", "last_month"]:
-        df = load_transactions("all")
-    else:
-        df = load_transactions(period)
+    # โหลดข้อมูลทั้งหมด แล้ว filter ทีหลังตามโหมดที่เลือก
+    df = load_transactions("all")
 
     if df.empty:
         st.info("ยังไม่มีข้อมูล — กรุณานำเข้า Statement ในเมนู 'นำเข้า Statement' ก่อน")
         return
 
-    # Adjust month if billing cycle mode
-    if group_mode == "รอบบิล (ตามวันตัดรอบ)":
-        # ตรวจสอบว่ามี cutoff_day หลายค่าไหม
-        unique_cutoffs = df["cutoff_day"].dropna().unique()
-        if len(unique_cutoffs) > 1:
-            cutoff_list = ", ".join(map(str, sorted(unique_cutoffs)))
-            st.info(f"📌 ข้อมูลรวมจากหลายบัตร มี {len(unique_cutoffs)} วันตัดรอบต่างกัน ({cutoff_list}) — ใช้วันตัดรอบของแต่ละ statement ในการคำนวณ")
-        elif len(unique_cutoffs) == 0:
-            st.info(f"ℹ️ ไม่มีข้อมูลวันตัดรอบใน statement — ใช้ค่าที่ตั้งไว้ ({cutoff_day}) สำหรับทุกรายการ")
-
-        # ใช้ per-transaction cutoff_day ถ้ามี, ไม่งั้นใช้ค่า fallback
-        df["effective_cutoff"] = df["cutoff_day"].fillna(cutoff_day)
-
-        # ถ้า trans_date.day > effective_cutoff → นับเป็นรอบถัดไป
-        adjusted = df.apply(
-            lambda row: row["trans_date"].replace(day=1) + pd.DateOffset(months=1)
-                if row["trans_date"].day > row["effective_cutoff"]
-                else row["trans_date"].replace(day=1),
-            axis=1
-        )
-        df["adjusted_month"] = adjusted.dt.to_period("M")
-
-        # Filter by period using adjusted month
+    if group_mode == "งวดบิล":
+        # ใช้ period ของ statement โดยตรง (YYYY-MM) — ไม่ต้องคำนวณวันตัดรอบ
+        # ทุก statement มี period อยู่แล้ว → KBank ก.พ. + KTB ก.พ. = period "2026-02" เดียวกัน
         if period == "current_month":
-            target = pd.Timestamp.now().to_period("M")
-            df = df[df["adjusted_month"] == target]
+            target = pd.Timestamp.now().strftime("%Y-%m")
+            df = df[df["period"] == target]
         elif period == "last_month":
-            target = (pd.Timestamp.now() - pd.DateOffset(months=1)).to_period("M")
-            df = df[df["adjusted_month"] == target]
+            target = (pd.Timestamp.now() - pd.DateOffset(months=1)).strftime("%Y-%m")
+            df = df[df["period"] == target]
+        elif period in ["3_months", "6_months"]:
+            n = 3 if period == "3_months" else 6
+            all_periods = sorted(df["period"].dropna().unique(), reverse=True)
+            recent = all_periods[:n]
+            df = df[df["period"].isin(recent)]
+        # else "all": no filter
 
-        # Check if empty after filtering
         if df.empty:
-            st.warning(f"ไม่มีข้อมูลในรอบบิล {period_label} (ตัดรอบวันที่ {cutoff_day})")
+            st.warning(f"ไม่มีข้อมูลงวดบิล {period_label}")
             return
 
-        # Use adjusted month for grouping
-        df["month_sort"] = df["adjusted_month"].astype(str)
-        df["month_label"] = pd.to_datetime(df["month_sort"]).dt.strftime("%b %Y")
+        df["month_sort"]  = df["period"]
+        df["month_label"] = pd.to_datetime(df["period"] + "-01").dt.strftime("งวด %b %Y")
+
     else:
-        # Use trans_date as-is
-        df["month_sort"] = df["trans_date"].dt.strftime("%Y-%m")
+        # เดือนที่ใช้จ่ายจริง: filter โดย trans_date
+        if period == "current_month":
+            now = pd.Timestamp.now()
+            df = df[(df["trans_date"].dt.year == now.year) &
+                    (df["trans_date"].dt.month == now.month)]
+        elif period == "last_month":
+            lm = pd.Timestamp.now() - pd.DateOffset(months=1)
+            df = df[(df["trans_date"].dt.year == lm.year) &
+                    (df["trans_date"].dt.month == lm.month)]
+        elif period in ["3_months", "6_months"]:
+            n = 3 if period == "3_months" else 6
+            all_months = sorted(df["trans_date"].dt.to_period("M").dropna().unique(), reverse=True)
+            recent_months = all_months[:n]
+            df = df[df["trans_date"].dt.to_period("M").isin(recent_months)]
+
+        if df.empty:
+            st.warning(f"ไม่มีข้อมูลในช่วง {period_label}")
+            return
+
+        df["month_sort"]  = df["trans_date"].dt.strftime("%Y-%m")
         df["month_label"] = df["trans_date"].dt.strftime("%b %Y")
 
     # sort mapping: month_label → month_sort (for ordering)
@@ -980,38 +1027,6 @@ def page_settings():
             config["api_key"] = new_key
             CONFIG_PATH.write_text(json.dumps(config))
             st.success("บันทึกแล้ว — key เก็บใน config.json บนเครื่องคุณเท่านั้น")
-
-    st.divider()
-    st.subheader("ตั้งค่ารอบบิล")
-
-    # โหลดค่า cutoff_day จาก config
-    current_cutoff = 20  # default
-    if CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text())
-            current_cutoff = cfg.get("cutoff_day", 20)
-        except Exception:
-            pass
-
-    cutoff_day_setting = st.number_input(
-        "วันที่ตัดรอบบิล (ค่าเริ่มต้น)",
-        min_value=1,
-        max_value=28,
-        value=current_cutoff,
-        help="ตั้งค่าวันที่ตัดรอบบิลเริ่มต้น จะใช้ในหน้า Dashboard เมื่อเลือกโหมด 'รอบบิล'",
-    )
-
-    if st.button("บันทึกวันตัดรอบบิล"):
-        # อ่าน config เดิมก่อน
-        config = {}
-        if CONFIG_PATH.exists():
-            try:
-                config = json.loads(CONFIG_PATH.read_text())
-            except Exception:
-                pass
-        config["cutoff_day"] = cutoff_day_setting
-        CONFIG_PATH.write_text(json.dumps(config))
-        st.success(f"บันทึกแล้ว — วันตัดรอบบิล: {cutoff_day_setting}")
 
     st.divider()
     st.subheader("สถิติข้อมูล")
