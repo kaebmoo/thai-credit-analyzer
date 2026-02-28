@@ -242,6 +242,102 @@ def find_duplicate_statement(file_hash: str) -> dict | None:
             return dict(row)
     return None
 
+
+def find_similar_statement(bank: str, period: str, total_amount: float,
+                           tolerance: float = 0.05) -> list[dict]:
+    """ตรวจสอบ statement ที่ period ตรงกัน และยอดรวมใกล้เคียง (±tolerance)
+    ตรวจทั้งแบบ exact (period+bank) และ soft (period อย่างเดียว)
+    คืน list ของ statement ที่น่าสงสัยว่าเป็นข้อมูลซ้ำ"""
+    conn = get_db()
+    # ดึง statement ทุกอันที่ period ตรงกัน (ไม่จำกัด bank เพื่อรองรับชื่อที่ OCR อ่านต่างกัน)
+    rows = conn.execute(
+        """
+        SELECT s.id, s.filename, s.bank, s.period, s.imported_at,
+               COALESCE(SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END), 0) as total_amount
+        FROM statements s
+        LEFT JOIN transactions t ON t.statement_id = s.id
+        WHERE s.period = ?
+        GROUP BY s.id
+        """,
+        (period,),
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        existing_total = row["total_amount"]
+        if existing_total == 0 and total_amount == 0:
+            results.append({**dict(row), "diff_ratio": 0.0, "bank_match": row["bank"] == bank})
+            continue
+        if existing_total == 0:
+            continue
+        diff_ratio = abs(total_amount - existing_total) / max(abs(existing_total), 1)
+        if diff_ratio <= tolerance:
+            results.append({**dict(row), "diff_ratio": diff_ratio, "bank_match": row["bank"] == bank})
+    return results
+
+
+def find_overlapping_transactions(transactions: list[dict]) -> dict:
+    """ตรวจสอบว่ารายการใน transactions ซ้ำกับที่อยู่ใน DB มากแค่ไหน
+    ใช้ 2 วิธีคู่กัน:
+      - exact: trans_date + description + amount (±1) — แม่นยำ แต่อาจพลาดถ้า OCR ต่างกัน
+      - soft : trans_date + amount (±1) เท่านั้น — ตรวจจับได้แม้ description ต่างกัน
+    คืน dict: {exact_count, soft_count, overlap_ratio, total}"""
+    if not transactions:
+        return {"exact_count": 0, "soft_count": 0, "overlap_ratio": 0.0, "total": 0}
+
+    conn = get_db()
+    exact_count = 0
+    soft_count = 0
+    for t in transactions:
+        date_str = t.get("trans_date", "")
+        desc = t.get("description", "")
+        amount = float(t.get("amount", 0))
+        if amount <= 0:
+            continue  # ข้าม cashback/negative
+
+        # exact match
+        exact = conn.execute(
+            """
+            SELECT id FROM transactions
+            WHERE trans_date = ? AND description = ?
+              AND ABS(amount - ?) < 1.0
+            LIMIT 1
+            """,
+            (date_str, desc, amount),
+        ).fetchone()
+        if exact:
+            exact_count += 1
+
+        # soft match (date + amount เท่านั้น)
+        soft = conn.execute(
+            """
+            SELECT id FROM transactions
+            WHERE trans_date = ? AND ABS(amount - ?) < 1.0
+            LIMIT 1
+            """,
+            (date_str, amount),
+        ).fetchone()
+        if soft:
+            soft_count += 1
+
+    conn.close()
+
+    # นับเฉพาะรายการ amount > 0 เป็น base
+    positive_total = sum(1 for t in transactions if float(t.get("amount", 0)) > 0)
+    if positive_total == 0:
+        return {"exact_count": 0, "soft_count": 0, "overlap_ratio": 0.0, "total": len(transactions)}
+
+    # ใช้ soft_count เป็น ratio หลัก (ตรวจจับได้ดีกว่าเมื่อมาจากรูปภาพ)
+    ratio = soft_count / positive_total
+    return {
+        "exact_count": exact_count,
+        "soft_count": soft_count,
+        "overlap_ratio": ratio,
+        "total": len(transactions),
+        "positive_total": positive_total,
+    }
+
 # ─── Gemini ───────────────────────────────────────────────────────────────────
 
 def get_model():
@@ -733,57 +829,124 @@ def page_import():
         total = edited["amount"].sum()
         st.metric("รวมทั้งหมด", f"{total:,.2f} บาท")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("บันทึก", type="primary", use_container_width=True):
-                all_rows = edited.to_dict("records")
+        def _do_save(bank: str, final_rows: list):
+            """บันทึกรายการและล้าง session state ที่เกี่ยวข้อง"""
+            save_transactions(
+                bank,
+                st.session_state["pending_files"],
+                final_rows,
+                st.session_state.get("pending_cutoff_day"),
+                st.session_state.get("pending_file_hashes"),
+            )
+            n = len(final_rows)
+            for key in ["pending", "pending_bank", "pending_files",
+                        "pending_cutoff_day", "pending_file_hashes",
+                        "_dup_warnings", "_dup_pending_final", "_dup_pending_bank"]:
+                st.session_state.pop(key, None)
+            st.session_state["_import_success"] = (
+                f"✅ นำเข้าสำเร็จ! บันทึก {n} รายการ ({bank}) เรียบร้อยแล้ว"
+            )
+            st.session_state["_upload_rev"] = st.session_state.get("_upload_rev", 0) + 1
+            st.rerun()
 
-                # ตรวจสอบชื่อธนาคาร (อาจถูก auto-fill หลัง analyze หรือผู้ใช้กรอกเอง)
-                current_bank = st.session_state.get("_bank_input", "").strip()
-                if not current_bank:
-                    st.warning("กรุณาระบุชื่อธนาคาร / บัตร ก่อนบันทึก")
-                    st.stop()
-
-                # กรองบรรทัดว่างออก (เกิดจาก data_editor เพิ่มแถวว่าง หรือผู้ใช้ลบเนื้อหาในแถว)
-                final = [
-                    row for row in all_rows
-                    if str(row.get("description") or "").strip()
-                    and row.get("amount") is not None
-                    and not (isinstance(row.get("amount"), float) and pd.isna(row["amount"]))
-                ]
-
-                if not final:
-                    st.warning("ไม่มีรายการที่จะบันทึก กรุณาตรวจสอบรายการในตาราง")
-                else:
-                    # Merge back posting_date from original
-                    orig_map = {t["description"]: t for t in txns}
-                    for row in final:
-                        orig = orig_map.get(row["description"], {})
-                        row["posting_date"] = orig.get("posting_date", "")
-
-                    save_transactions(
-                        current_bank,
-                        st.session_state["pending_files"],
-                        final,
-                        st.session_state.get("pending_cutoff_day"),
-                        st.session_state.get("pending_file_hashes"),
+        # ── แสดง duplicate warning + ปุ่มยืนยัน (ถ้ามี) ──────────────────────
+        if st.session_state.get("_dup_warnings"):
+            warnings = st.session_state["_dup_warnings"]
+            st.warning("⚠️ **พบข้อมูลที่อาจซ้ำกับที่นำเข้าแล้ว** — กรุณาตรวจสอบก่อนบันทึก")
+            with st.expander("📋 รายละเอียดการตรวจพบความซ้ำ", expanded=True):
+                for w in warnings:
+                    st.markdown(w)
+            confirm = st.checkbox("ฉันเข้าใจและต้องการบันทึกซ้ำ (มีเหตุผลที่ต่างจากรายการเดิม)")
+            col_force, col_cancel_dup = st.columns(2)
+            with col_force:
+                if st.button("บันทึกซ้ำ", type="primary",
+                             disabled=not confirm, use_container_width=True):
+                    _do_save(
+                        st.session_state["_dup_pending_bank"],
+                        st.session_state["_dup_pending_final"],
                     )
-                    n = len(final)
-                    for key in ["pending", "pending_bank", "pending_files",
-                                "pending_cutoff_day", "pending_file_hashes"]:
+            with col_cancel_dup:
+                if st.button("ยกเลิก / แก้ไข", use_container_width=True):
+                    for key in ["_dup_warnings", "_dup_pending_final", "_dup_pending_bank"]:
                         st.session_state.pop(key, None)
-                    # เก็บข้อความสำเร็จ + เพิ่ม revision เพื่อ reset file uploader
-                    st.session_state["_import_success"] = (
-                        f"✅ นำเข้าสำเร็จ! บันทึก {n} รายการ ({current_bank}) เรียบร้อยแล้ว"
-                    )
-                    st.session_state["_upload_rev"] = st.session_state.get("_upload_rev", 0) + 1
+                    st.rerun()
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("บันทึก", type="primary", use_container_width=True):
+                    all_rows = edited.to_dict("records")
+
+                    current_bank = st.session_state.get("_bank_input", "").strip()
+                    if not current_bank:
+                        st.warning("กรุณาระบุชื่อธนาคาร / บัตร ก่อนบันทึก")
+                        st.stop()
+
+                    # กรองบรรทัดว่างออก
+                    final = [
+                        row for row in all_rows
+                        if str(row.get("description") or "").strip()
+                        and row.get("amount") is not None
+                        and not (isinstance(row.get("amount"), float) and pd.isna(row["amount"]))
+                    ]
+
+                    if not final:
+                        st.warning("ไม่มีรายการที่จะบันทึก กรุณาตรวจสอบรายการในตาราง")
+                    else:
+                        # Merge back posting_date from original
+                        orig_map = {t["description"]: t for t in txns}
+                        for row in final:
+                            orig = orig_map.get(row["description"], {})
+                            row["posting_date"] = orig.get("posting_date", "")
+
+                        # ── ตรวจสอบซ้ำ 2 ระดับ ───────────────────────────────
+                        total_amount = sum(r["amount"] for r in final
+                                          if (r.get("amount") or 0) > 0)
+                        dates = [r["trans_date"] for r in final if r.get("trans_date")]
+                        est_period = max(dates)[:7] if dates else ""
+
+                        dup_warnings = []
+
+                        # Level 1: period + amount-sum (±5%) — ไม่ filter ด้วย bank
+                        if est_period:
+                            similar = find_similar_statement(current_bank, est_period, total_amount)
+                            for s in similar:
+                                diff_pct = s.get("diff_ratio", 0) * 100
+                                bank_note = "✅ ธนาคารเดียวกัน" if s.get("bank_match") else f"❓ ธนาคาร: **{s['bank']}**"
+                                dup_warnings.append(
+                                    f"⚠️ **[ระดับ Statement]** พบ statement ที่คล้ายกัน: "
+                                    f"งวด **{s['period']}** {bank_note} "
+                                    f"(นำเข้าเมื่อ {s['imported_at'][:10]}) — "
+                                    f"ยอดรวมต่างกัน **{diff_pct:.1f}%**"
+                                )
+
+                        # Level 2: transaction-level overlap (≥50% soft match = date+amount)
+                        overlap = find_overlapping_transactions(final)
+                        pos_total = overlap.get("positive_total", overlap.get("total", 1))
+                        if overlap["overlap_ratio"] >= 0.5:
+                            exact = overlap.get("exact_count", 0)
+                            soft  = overlap.get("soft_count", 0)
+                            dup_warnings.append(
+                                f"⚠️ **[ระดับรายการ]** พบรายการที่ตรงกับ DB แล้ว: "
+                                f"ตรงทั้ง desc+amount **{exact}/{pos_total}** รายการ | "
+                                f"ตรงเฉพาะวัน+amount **{soft}/{pos_total}** รายการ "
+                                f"(**{overlap['overlap_ratio']*100:.0f}%**)"
+                            )
+
+
+                        if dup_warnings:
+                            st.session_state["_dup_warnings"] = dup_warnings
+                            st.session_state["_dup_pending_final"] = final
+                            st.session_state["_dup_pending_bank"] = current_bank
+                            st.rerun()
+                        else:
+                            _do_save(current_bank, final)
+
+            with c2:
+                if st.button("ยกเลิก", use_container_width=True):
+                    for key in ["pending", "pending_bank", "pending_files"]:
+                        st.session_state.pop(key, None)
                     st.rerun()
 
-        with c2:
-            if st.button("ยกเลิก", use_container_width=True):
-                for key in ["pending", "pending_bank", "pending_files"]:
-                    st.session_state.pop(key, None)
-                st.rerun()
 
 
 def page_dashboard():
