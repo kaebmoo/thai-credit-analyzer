@@ -668,6 +668,14 @@ def process_uploaded_file(raw: bytes, filename: str, model, password: str = "") 
 def page_import():
     st.header("นำเข้า Statement")
 
+    # ── ตรวจสอบ API Key ก่อนแสดง UI (ป้องกัน st.stop() กลางหน้า) ───────────
+    if not st.session_state.get("api_key"):
+        st.warning("⚠️ กรุณาตั้งค่า Gemini API Key ในหน้า 'ตั้งค่า' ก่อนนำเข้า Statement")
+        if st.button("ไปหน้าตั้งค่า →"):
+            st.session_state["_goto_settings"] = True
+            st.rerun()
+        return
+
     # ── แสดง banner เมื่อ save สำเร็จ (ค้างไว้ 1 render แล้วล้างทิ้ง) ──────────
     if st.session_state.get("_import_success"):
         msg = st.session_state.pop("_import_success")
@@ -1331,10 +1339,14 @@ def main():
     if not st.session_state.get("api_key"):
         st.sidebar.warning("ยังไม่ได้ตั้งค่า API Key")
 
-    page = st.sidebar.radio(
-        "เมนู",
-        ["Dashboard", "นำเข้า Statement", "ประวัติการนำเข้า", "ตั้งค่า"],
-    )
+    # handle redirect จาก page_import() เมื่อไม่มี API key
+    if st.session_state.pop("_goto_settings", False):
+        page = "ตั้งค่า"
+    else:
+        page = st.sidebar.radio(
+            "เมนู",
+            ["Dashboard", "นำเข้า Statement", "ประวัติการนำเข้า", "ตั้งค่า"],
+        )
 
     if page == "Dashboard":
         page_dashboard()
@@ -1344,6 +1356,7 @@ def main():
         page_history()
     elif page == "ตั้งค่า":
         page_settings()
+
 
 
 if __name__ == "__main__":
